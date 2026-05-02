@@ -351,3 +351,220 @@ func TestConvertOpenAIResponsesRequestToClaude_PreservesContentPartCacheControl(
 		t.Fatalf("content.1 should not have cache_control. Output: %s", result)
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToClaude_ReplaysReasoningBeforeFunctionCall(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[
+			{
+				"type":"reasoning",
+				"id":"rs_prev",
+				"summary":[{"type":"summary_text","text":"previous thinking block"}]
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_123",
+				"name":"read_file",
+				"arguments":"{\"path\":\"README.md\"}"
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call_123",
+				"output":"file content"
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("deepseek-v4-flash", inputJSON, true)
+
+	messages := gjson.GetBytes(result, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		t.Fatalf("messages missing: %s", string(result))
+	}
+	if got := len(messages.Array()); got != 2 {
+		t.Fatalf("messages len = %d, want 2: %s", got, string(result))
+	}
+
+	first := messages.Array()[0]
+	if got := first.Get("role").String(); got != "assistant" {
+		t.Fatalf("first role = %q, want assistant", got)
+	}
+	if got := first.Get("content.0.type").String(); got != "thinking" {
+		t.Fatalf("first content[0].type = %q, want thinking", got)
+	}
+	if got := first.Get("content.0.thinking").String(); got != "previous thinking block" {
+		t.Fatalf("first thinking = %q", got)
+	}
+	if got := first.Get("content.1.type").String(); got != "tool_use" {
+		t.Fatalf("first content[1].type = %q, want tool_use", got)
+	}
+	if got := first.Get("content.1.id").String(); got != "call_123" {
+		t.Fatalf("tool_use id = %q, want call_123", got)
+	}
+
+	second := messages.Array()[1]
+	if got := second.Get("role").String(); got != "user" {
+		t.Fatalf("second role = %q, want user", got)
+	}
+	if got := second.Get("content.0.type").String(); got != "tool_result" {
+		t.Fatalf("second content[0].type = %q, want tool_result", got)
+	}
+	if got := second.Get("content.0.tool_use_id").String(); got != "call_123" {
+		t.Fatalf("tool_result tool_use_id = %q, want call_123", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_ReplaysReasoningAsAssistantMessage(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[
+			{
+				"type":"reasoning",
+				"id":"rs_prev",
+				"summary":[{"type":"summary_text","text":"carry this thinking"}]
+			},
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"continuing answer"}]
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("deepseek-v4-flash", inputJSON, false)
+	messages := gjson.GetBytes(result, "messages")
+	if got := len(messages.Array()); got != 1 {
+		t.Fatalf("messages len = %d, want 1: %s", got, string(result))
+	}
+
+	msg := messages.Array()[0]
+	if got := msg.Get("role").String(); got != "assistant" {
+		t.Fatalf("role = %q, want assistant", got)
+	}
+	if got := msg.Get("content.0.type").String(); got != "thinking" {
+		t.Fatalf("content[0].type = %q, want thinking", got)
+	}
+	if got := msg.Get("content.0.thinking").String(); got != "carry this thinking" {
+		t.Fatalf("thinking = %q", got)
+	}
+	if got := msg.Get("content.1.type").String(); got != "text" {
+		t.Fatalf("content[1].type = %q, want text", got)
+	}
+	if got := msg.Get("content.1.text").String(); got != "continuing answer" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MergesAssistantTextAndToolUseIntoSameMessage(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"deepseek-v4-flash",
+		"input":[
+			{
+				"type":"reasoning",
+				"id":"rs_prev",
+				"summary":[{"type":"summary_text","text":"carry this thinking"}]
+			},
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"continuing answer"}]
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_456",
+				"name":"read_file",
+				"arguments":"{\"path\":\"README.md\"}"
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("deepseek-v4-flash", inputJSON, false)
+	messages := gjson.GetBytes(result, "messages")
+	if got := len(messages.Array()); got != 1 {
+		t.Fatalf("messages len = %d, want 1: %s", got, string(result))
+	}
+
+	msg := messages.Array()[0]
+	if got := msg.Get("role").String(); got != "assistant" {
+		t.Fatalf("role = %q, want assistant", got)
+	}
+	if got := msg.Get("content.0.type").String(); got != "thinking" {
+		t.Fatalf("content[0].type = %q, want thinking", got)
+	}
+	if got := msg.Get("content.1.type").String(); got != "text" {
+		t.Fatalf("content[1].type = %q, want text", got)
+	}
+	if got := msg.Get("content.1.text").String(); got != "continuing answer" {
+		t.Fatalf("content[1].text = %q, want continuing answer", got)
+	}
+	if got := msg.Get("content.2.type").String(); got != "tool_use" {
+		t.Fatalf("content[2].type = %q, want tool_use", got)
+	}
+	if got := msg.Get("content.2.id").String(); got != "call_456" {
+		t.Fatalf("content[2].id = %q, want call_456", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_GroupsConsecutiveToolResultsIntoSameUserMessage(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"deepseek-v4-pro",
+		"input":[
+			{
+				"type":"function_call",
+				"call_id":"call_a",
+				"name":"tool_a",
+				"arguments":"{}"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_b",
+				"name":"tool_b",
+				"arguments":"{}"
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call_a",
+				"output":"result a"
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call_b",
+				"output":"result b"
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("deepseek-v4-pro", inputJSON, false)
+	messages := gjson.GetBytes(result, "messages")
+	if got := len(messages.Array()); got != 2 {
+		t.Fatalf("messages len = %d, want 2: %s", got, string(result))
+	}
+
+	first := messages.Array()[0]
+	if got := first.Get("role").String(); got != "assistant" {
+		t.Fatalf("first role = %q, want assistant", got)
+	}
+	if got := first.Get("content.0.type").String(); got != "tool_use" {
+		t.Fatalf("first content[0].type = %q, want tool_use", got)
+	}
+	if got := first.Get("content.1.type").String(); got != "tool_use" {
+		t.Fatalf("first content[1].type = %q, want tool_use", got)
+	}
+
+	second := messages.Array()[1]
+	if got := second.Get("role").String(); got != "user" {
+		t.Fatalf("second role = %q, want user", got)
+	}
+	if got := second.Get("content.0.type").String(); got != "tool_result" {
+		t.Fatalf("second content[0].type = %q, want tool_result", got)
+	}
+	if got := second.Get("content.0.tool_use_id").String(); got != "call_a" {
+		t.Fatalf("second content[0].tool_use_id = %q, want call_a", got)
+	}
+	if got := second.Get("content.1.type").String(); got != "tool_result" {
+		t.Fatalf("second content[1].type = %q, want tool_result", got)
+	}
+	if got := second.Get("content.1.tool_use_id").String(); got != "call_b" {
+		t.Fatalf("second content[1].tool_use_id = %q, want call_b", got)
+	}
+}
