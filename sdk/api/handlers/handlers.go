@@ -1042,12 +1042,40 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		defer close(errChan)
 		chunkIndex := 0
 		var historyChunks [][]byte
+		var responsesValidator openAIResponsesSSEValidator
+		sendPayloads := func(payloads [][]byte) bool {
+			for _, payload := range payloads {
+				streamHeadersCommitted = true
+				select {
+				case dataChan <- cloneBytes(payload):
+					if streamInterceptorsActive {
+						historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
+					}
+				case <-done:
+					return false
+				}
+			}
+			return true
+		}
 		for {
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
 			if canceled {
 				return
 			}
 			if !ok {
+				if responseProtocol == "openai-response" {
+					release, err := responsesValidator.Finish()
+					if err != nil {
+						select {
+						case errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}:
+						case <-done:
+						}
+						return
+					}
+					if !sendPayloads(release) {
+						return
+					}
+				}
 				return
 			}
 			if chunk.Err != nil {
@@ -1086,22 +1114,22 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			} else {
 				chunkIndex++
 			}
+			payloads := [][]byte{payload}
 			if responseProtocol == "openai-response" {
-				if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+				validatedPayloads, errValidate := responsesValidator.AddChunk(payload)
+				if errValidate != nil {
 					select {
 					case errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate}:
 					case <-done:
 					}
 					return
 				}
-			}
-			streamHeadersCommitted = true
-			select {
-			case dataChan <- payload:
-				if streamInterceptorsActive {
-					historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
+				if len(validatedPayloads) == 0 {
+					continue
 				}
-			case <-done:
+				payloads = validatedPayloads
+			}
+			if !sendPayloads(payloads) {
 				return
 			}
 		}
@@ -1315,6 +1343,20 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				return status >= http.StatusInternalServerError
 			}
 		}
+		var responsesValidator openAIResponsesSSEValidator
+		forwardValidatedPayloads := func(payloads [][]byte) bool {
+			for _, payload := range payloads {
+				sentPayload = true
+				streamHeadersCommitted = true
+				if okSendData := sendData(cloneBytes(payload)); !okSendData {
+					return false
+				}
+				if streamInterceptorsActive {
+					historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
+				}
+			}
+			return true
+		}
 
 	outer:
 		for {
@@ -1325,6 +1367,16 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				}
 				if !ok {
 					applyStreamHeaderInit()
+					if responseProtocol == "openai-response" {
+						release, err := responsesValidator.Finish()
+						if err != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							return
+						}
+						if !forwardValidatedPayloads(release) {
+							return
+						}
+					}
 					return
 				}
 				if chunk.Err != nil {
@@ -1343,6 +1395,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 								streamHeadersCommitted = false
 								pendingChunks = nil
 								streamClosedBeforeRead = false
+								responsesValidator = openAIResponsesSSEValidator{}
 								chunks = retryResult.Chunks
 								continue outer
 							}
@@ -1394,19 +1447,20 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					} else {
 						chunkIndex++
 					}
+					payloads := [][]byte{payload}
 					if responseProtocol == "openai-response" {
-						if errValidate := validateSSEDataJSON(payload); errValidate != nil {
+						validatedPayloads, errValidate := responsesValidator.AddChunk(payload)
+						if errValidate != nil {
 							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errValidate})
 							return
 						}
+						if len(validatedPayloads) == 0 {
+							continue
+						}
+						payloads = validatedPayloads
 					}
-					sentPayload = true
-					streamHeadersCommitted = true
-					if okSendData := sendData(payload); !okSendData {
+					if !forwardValidatedPayloads(payloads) {
 						return
-					}
-					if streamInterceptorsActive {
-						historyChunks = appendStreamInterceptorHistory(historyChunks, payload)
 					}
 				}
 			}
@@ -1415,35 +1469,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
-}
-
-func validateSSEDataJSON(chunk []byte) error {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(line[5:])
-		if len(data) == 0 {
-			continue
-		}
-		if bytes.Equal(data, []byte("[DONE]")) {
-			continue
-		}
-		if json.Valid(data) {
-			continue
-		}
-		const max = 512
-		preview := data
-		if len(preview) > max {
-			preview = preview[:max]
-		}
-		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
-	}
-	return nil
 }
 
 func preferExecutionProvider(providers []string, preferred string) []string {
