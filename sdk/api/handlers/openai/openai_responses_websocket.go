@@ -1375,6 +1375,49 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	if c != nil && c.Request != nil {
 		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
 	}
+	acc := &sseFrameAccumulator{}
+	logAPIResponseError := func(errMsg *interfaces.ErrorMessage) {
+		if h == nil || errMsg == nil {
+			return
+		}
+		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+	}
+	processPayloads := func(payloads [][]byte) (*interfaces.ErrorMessage, error) {
+		for i := range payloads {
+			collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
+			eventType := gjson.GetBytes(payloads[i], "type").String()
+			if isResponsesWebsocketCompletionEvent(eventType) {
+				payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
+			}
+			recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+			recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
+			var payloadErrMsg *interfaces.ErrorMessage
+			if eventType == wsEventTypeError {
+				payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
+				logAPIResponseError(payloadErrMsg)
+			} else if isResponsesWebsocketCompletionEvent(eventType) {
+				completed = true
+				completedOutput = responseCompletedOutputFromPayload(payloads[i], outputItemsByIndex, outputItemsFallback)
+				completedResponseID = responseCompletedIDFromPayload(payloads[i])
+			}
+			markAPIResponseTimestamp(c)
+			if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
+				log.Warnf(
+					"responses websocket: downstream_out write failed id=%s event=%s error=%v",
+					sessionID,
+					websocketPayloadEventType(payloads[i]),
+					errWrite,
+				)
+				cancel(errWrite)
+				return nil, errWrite
+			}
+			if payloadErrMsg != nil {
+				cancel(payloadErrMsg.Error)
+				return payloadErrMsg, nil
+			}
+		}
+		return nil, nil
+	}
 
 	for {
 		select {
@@ -1387,7 +1430,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				continue
 			}
 			if errMsg != nil {
-				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+				logAPIResponseError(errMsg)
 				markAPIResponseTimestamp(c)
 				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
 				log.Infof(
@@ -1416,12 +1459,21 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
 		case chunk, ok := <-data:
 			if !ok {
+				for _, frame := range acc.Flush() {
+					payloadErrMsg, errProcess := processPayloads(websocketJSONPayloadsFromChunk(frame))
+					if errProcess != nil {
+						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errProcess
+					}
+					if payloadErrMsg != nil {
+						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+					}
+				}
 				if !completed {
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),
 					}
-					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+					logAPIResponseError(errMsg)
 					markAPIResponseTimestamp(c)
 					errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
 					log.Infof(
@@ -1448,46 +1500,23 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
 			}
 
-			payloads := websocketJSONPayloadsFromChunk(chunk)
-			for i := range payloads {
-				collectResponsesWebsocketOutputItem(payloads[i], outputItemsByIndex, &outputItemsFallback)
-				eventType := gjson.GetBytes(payloads[i], "type").String()
-				if isResponsesWebsocketCompletionEvent(eventType) {
-					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
-				}
-				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
-				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
-				var payloadErrMsg *interfaces.ErrorMessage
-				if eventType == wsEventTypeError {
-					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
-					if h != nil {
-						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
-					}
-				} else if isResponsesWebsocketCompletionEvent(eventType) {
-					completed = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i], outputItemsByIndex, outputItemsFallback)
-					completedResponseID = responseCompletedIDFromPayload(payloads[i])
-				}
-				markAPIResponseTimestamp(c)
-				// log.Infof(
-				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-				// 	sessionID,
-				// 	websocket.TextMessage,
-				// 	websocketPayloadEventType(payloads[i]),
-				// 	websocketPayloadPreview(payloads[i]),
-				// )
-				if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
-					log.Warnf(
-						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-						sessionID,
-						websocketPayloadEventType(payloads[i]),
-						errWrite,
-					)
-					cancel(errWrite)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
+			if len(acc.pending) == 0 && !responsesWebsocketChunkLooksLikeSSE(chunk) {
+				payloadErrMsg, errProcess := processPayloads(websocketJSONPayloadsFromChunk(chunk))
+				if errProcess != nil {
+					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errProcess
 				}
 				if payloadErrMsg != nil {
-					cancel(payloadErrMsg.Error)
+					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+				}
+				continue
+			}
+
+			for _, frame := range acc.AddChunk(chunk) {
+				payloadErrMsg, errProcess := processPayloads(websocketJSONPayloadsFromChunk(frame))
+				if errProcess != nil {
+					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errProcess
+				}
+				if payloadErrMsg != nil {
 					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
 				}
 			}
@@ -1643,6 +1672,18 @@ func sortedStringSet(values map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func responsesWebsocketChunkLooksLikeSSE(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte("id:")) ||
+		bytes.HasPrefix(trimmed, []byte("retry:")) ||
+		bytes.HasPrefix(trimmed, []byte(":"))
 }
 
 func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {

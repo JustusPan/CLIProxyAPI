@@ -936,6 +936,28 @@ func TestWebsocketJSONPayloadsFromPlainJSONChunk(t *testing.T) {
 	}
 }
 
+func TestWebsocketJSONPayloadsFromSplitSSEChunk(t *testing.T) {
+	acc := &sseFrameAccumulator{}
+
+	frames := acc.AddChunk([]byte("data: {\"type\":\"response.completed\""))
+	if len(frames) != 0 {
+		t.Fatalf("expected no complete frame yet, got %d", len(frames))
+	}
+
+	frames = acc.AddChunk([]byte(",\"response\":{\"id\":\"resp-1\"}}\n\n"))
+	if len(frames) != 1 {
+		t.Fatalf("frames len = %d, want 1", len(frames))
+	}
+
+	payloads := websocketJSONPayloadsFromChunk(frames[0])
+	if len(payloads) != 1 {
+		t.Fatalf("payloads len = %d, want 1", len(payloads))
+	}
+	if gjson.GetBytes(payloads[0], "type").String() != "response.completed" {
+		t.Fatalf("unexpected payload type: %s", gjson.GetBytes(payloads[0], "type").String())
+	}
+}
+
 func TestResponseCompletedOutputFromPayload(t *testing.T) {
 	payload := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","id":"out-1"}]}}`)
 
@@ -1436,6 +1458,96 @@ func TestForwardResponsesWebsocketRestoresAndForwardsCompletedOutput(t *testing.
 	}
 	if got := gjson.GetBytes(payload, "response.output.0.id").String(); got != "call-1" {
 		t.Fatalf("downstream completion output id = %q, want call-1; payload=%s", got, payload)
+	}
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestForwardResponsesWebsocketPreservesSplitCompletedEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() {
+			errClose := conn.Close()
+			if errClose != nil {
+				serverErrCh <- errClose
+			}
+		}()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+
+		data := make(chan []byte, 2)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte("data: {\"type\":\"response.completed\"")
+		data <- []byte(",\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"message\",\"id\":\"out-1\"}]}}\n\n")
+		close(data)
+		close(errCh)
+
+		timelineLog := newInMemoryWebsocketTimelineLog()
+		completedOutput, completedResponseID, pendingToolCallIDs, errMsg, err := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			timelineLog,
+			"session-1",
+		)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		if errMsg != nil {
+			serverErrCh <- fmt.Errorf("unexpected websocket error message: %v", errMsg.Error)
+			return
+		}
+		if gjson.GetBytes(completedOutput, "0.id").String() != "out-1" {
+			serverErrCh <- errors.New("completed output not captured")
+			return
+		}
+		if completedResponseID != "resp-1" {
+			serverErrCh <- fmt.Errorf("completed response id = %q, want resp-1", completedResponseID)
+			return
+		}
+		if len(pendingToolCallIDs) != 0 {
+			serverErrCh <- fmt.Errorf("pending tool call ids = %v, want empty", pendingToolCallIDs)
+			return
+		}
+		if !strings.Contains(timelineLog.String(), "\"type\":\"response.completed\"") {
+			serverErrCh <- errors.New("websocket timeline did not capture completed response")
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		errClose := conn.Close()
+		if errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
+		t.Fatalf("payload type = %s, want %s", gjson.GetBytes(payload, "type").String(), wsEventTypeCompleted)
 	}
 
 	if errServer := <-serverErrCh; errServer != nil {
