@@ -635,6 +635,10 @@ type OpenAICompatibility struct {
 	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 
+	// DeepSeekThinkingCompatibility enables DeepSeek-specific thinking/tool-call
+	// compatibility for this OpenAI-compatible provider.
+	DeepSeekThinkingCompatibility bool `yaml:"deepseek-thinking-compatibility,omitempty" json:"deepseek-thinking-compatibility,omitempty"`
+
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
 

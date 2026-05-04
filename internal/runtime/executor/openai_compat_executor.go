@@ -22,6 +22,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -127,6 +128,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = updated
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
+	}
+	if to.String() == "openai" {
+		translated = e.applyDeepSeekThinkingCompatibility(auth, translated, originalPayload, from.String(), requestedModel, req.Model, baseModel)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -323,6 +327,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = e.applyDeepSeekThinkingCompatibility(auth, translated, originalPayload, from.String(), requestedModel, req.Model, baseModel)
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
@@ -772,6 +777,178 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 		}
 	}
 	return nil
+}
+
+func isDeepSeekV4Model(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	model = thinking.ParseSuffix(model).ModelName
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(model, "deepseek-v4")
+}
+
+func deepSeekV4ThinkingCompatibilityEnabledForModels(models ...string) bool {
+	for _, model := range models {
+		if isDeepSeekV4Model(model) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *OpenAICompatExecutor) deepSeekThinkingCompatibilityEnabled(auth *cliproxyauth.Auth, models ...string) bool {
+	if deepSeekV4ThinkingCompatibilityEnabledForModels(models...) {
+		return true
+	}
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["deepseek_thinking_compatibility"]); raw != "" {
+			return strings.EqualFold(raw, "true") || raw == "1" || strings.EqualFold(raw, "yes")
+		}
+	}
+	if compat := e.resolveCompatConfig(auth); compat != nil {
+		return compat.DeepSeekThinkingCompatibility
+	}
+	return false
+}
+
+func (e *OpenAICompatExecutor) applyDeepSeekThinkingCompatibility(auth *cliproxyauth.Auth, translated, original []byte, sourceFormat string, models ...string) []byte {
+	if !strings.EqualFold(strings.TrimSpace(sourceFormat), "openai-response") {
+		return translated
+	}
+	models = append(models, gjson.GetBytes(translated, "model").String(), gjson.GetBytes(original, "model").String())
+	if !e.deepSeekThinkingCompatibilityEnabled(auth, models...) {
+		return translated
+	}
+	return applyDeepSeekResponsesChatCompatibility(translated, original)
+}
+
+func applyDeepSeekResponsesChatCompatibility(translated, original []byte) []byte {
+	root := gjson.ParseBytes(original)
+	input := root.Get("input")
+	if !input.Exists() || !input.IsArray() {
+		return translated
+	}
+	messages := gjson.GetBytes(translated, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return translated
+	}
+
+	out := translated
+	pendingReasoning := make([]string, 0)
+
+	extractReasoningTexts := func(item gjson.Result) []string {
+		var texts []string
+		if summary := item.Get("summary"); summary.Exists() && summary.IsArray() {
+			summary.ForEach(func(_, part gjson.Result) bool {
+				if part.Get("type").String() != "summary_text" {
+					return true
+				}
+				text := strings.TrimSpace(part.Get("text").String())
+				if text != "" {
+					texts = append(texts, text)
+				}
+				return true
+			})
+		}
+		if len(texts) == 0 {
+			text := strings.TrimSpace(item.Get("text").String())
+			if text != "" {
+				texts = append(texts, text)
+			}
+		}
+		return texts
+	}
+
+	assistantToolCallMessageIndex := func(callID string) int {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			return -1
+		}
+		found := -1
+		gjson.GetBytes(out, "messages").ForEach(func(msgKey, msg gjson.Result) bool {
+			if msg.Get("role").String() != "assistant" {
+				return true
+			}
+			toolCalls := msg.Get("tool_calls")
+			if !toolCalls.Exists() || !toolCalls.IsArray() {
+				return true
+			}
+			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+				if toolCall.Get("id").String() == callID {
+					found = int(msgKey.Int())
+					return false
+				}
+				return true
+			})
+			return found == -1
+		})
+		return found
+	}
+
+	applyReasoningToAssistantToolCall := func(callID string) {
+		if len(pendingReasoning) == 0 {
+			return
+		}
+		msgIdx := assistantToolCallMessageIndex(callID)
+		if msgIdx < 0 {
+			return
+		}
+		msgPath := fmt.Sprintf("messages.%d", msgIdx)
+		msg := gjson.GetBytes(out, msgPath)
+		if !msg.Exists() || msg.Get("role").String() != "assistant" {
+			return
+		}
+		toolCalls := msg.Get("tool_calls")
+		if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+			return
+		}
+		if !msg.Get("content").Exists() {
+			out, _ = sjson.SetBytes(out, msgPath+".content", "")
+		}
+		if strings.TrimSpace(msg.Get("reasoning_content").String()) == "" {
+			out, _ = sjson.SetBytes(out, msgPath+".reasoning_content", strings.Join(pendingReasoning, "\n"))
+		}
+		pendingReasoning = nil
+	}
+
+	input.ForEach(func(_, item gjson.Result) bool {
+		itemType := item.Get("type").String()
+		if itemType == "" && item.Get("role").String() != "" {
+			itemType = "message"
+		}
+
+		switch itemType {
+		case "reasoning":
+			pendingReasoning = append(pendingReasoning, extractReasoningTexts(item)...)
+		case "message", "":
+			role := item.Get("role").String()
+			if role == "developer" {
+				role = "user"
+			}
+			if role != "assistant" {
+				pendingReasoning = nil
+			}
+		case "function_call":
+			applyReasoningToAssistantToolCall(item.Get("call_id").String())
+		case "function_call_output":
+			pendingReasoning = nil
+		default:
+			pendingReasoning = nil
+		}
+		return true
+	})
+
+	if reasoning := root.Get("reasoning"); reasoning.Exists() {
+		thinkingType := "enabled"
+		if effort := strings.ToLower(strings.TrimSpace(reasoning.Get("effort").String())); effort == "none" {
+			thinkingType = "disabled"
+		}
+		out, _ = sjson.SetBytes(out, "thinking.type", thinkingType)
+	}
+
+	return out
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {

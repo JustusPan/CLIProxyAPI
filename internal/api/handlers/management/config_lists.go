@@ -627,14 +627,15 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name           *string                             `json:"name"`
-		Prefix         *string                             `json:"prefix"`
-		Disabled       *bool                               `json:"disabled"`
-		DisableCooling *bool                               `json:"disable-cooling"`
-		BaseURL        *string                             `json:"base-url"`
-		APIKeyEntries  *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models         *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers        *map[string]string                  `json:"headers"`
+		Name                          *string                             `json:"name"`
+		Prefix                        *string                             `json:"prefix"`
+		Disabled                      *bool                               `json:"disabled"`
+		DisableCooling                *bool                               `json:"disable-cooling"`
+		BaseURL                       *string                             `json:"base-url"`
+		DeepSeekThinkingCompatibility *bool                               `json:"deepseek-thinking-compatibility"`
+		APIKeyEntries                 *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models                        *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers                       *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -688,6 +689,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 			return
 		}
 		entry.BaseURL = trimmed
+	}
+	if body.Value.DeepSeekThinkingCompatibility != nil {
+		entry.DeepSeekThinkingCompatibility = *body.Value.DeepSeekThinkingCompatibility
 	}
 	if body.Value.APIKeyEntries != nil {
 		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)

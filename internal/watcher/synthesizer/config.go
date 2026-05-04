@@ -268,6 +268,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			if compat.DeepSeekThinkingCompatibility {
+				attrs["deepseek_thinking_compatibility"] = "true"
+			}
 			if key != "" {
 				attrs["api_key"] = key
 			}
@@ -309,6 +312,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
+			}
+			if compat.DeepSeekThinkingCompatibility {
+				attrs["deepseek_thinking_compatibility"] = "true"
 			}
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash
