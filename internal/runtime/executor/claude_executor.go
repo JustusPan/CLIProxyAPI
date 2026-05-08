@@ -153,6 +153,14 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecu
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+func claudeEndpointURL(baseURL, endpoint string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return endpoint
+	}
+	return base + endpoint
+}
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -281,7 +289,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+	url := claudeEndpointURL(baseURL, "/v1/messages?beta=true")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err
@@ -470,7 +478,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
+	url := claudeEndpointURL(baseURL, "/v1/messages?beta=true")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return nil, err
@@ -726,7 +734,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
 
-	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
+	url := claudeEndpointURL(baseURL, "/v1/messages/count_tokens?beta=true")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
