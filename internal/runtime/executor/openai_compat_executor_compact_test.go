@@ -142,6 +142,73 @@ func TestOpenAICompatExecutorPreservesPromptCacheKeyForResponsesSource(t *testin
 	}
 }
 
+func TestOpenAICompatExecutorInjectsQwenMessageCacheControl(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"qwen3.6-plus","input":[{"type":"message","role":"user","content":"turn 1"},{"type":"message","role":"assistant","content":"ok"},{"type":"message","role":"user","content":"turn 2"}]}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "qwen3.6-plus",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("messages.0.content.0.cache_control.type = %q, want ephemeral; body=%s", got, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "messages.2.content.0.cache_control").Exists() {
+		t.Fatalf("last user turn should not receive cache_control; body=%s", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorDoesNotInjectKimiMessageCacheControl(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"kimi-k2.6","input":[{"type":"message","role":"user","content":"turn 1"},{"type":"message","role":"assistant","content":"ok"},{"type":"message","role":"user","content":"turn 2"}]}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "kimi-k2.6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if gjson.GetBytes(gotBody, "messages.0.content.0.cache_control").Exists() || gjson.GetBytes(gotBody, "messages.2.content.0.cache_control").Exists() {
+		t.Fatalf("kimi request should not receive injected cache_control; body=%s", string(gotBody))
+	}
+}
+
 func TestOpenAICompatExecutorImagesGenerationsPassthrough(t *testing.T) {
 	var gotPath string
 	var gotBody []byte

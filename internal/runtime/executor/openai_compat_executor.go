@@ -131,6 +131,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	if to.String() == "openai" {
 		translated = e.applyDeepSeekThinkingCompatibility(auth, translated, originalPayload, from.String(), requestedModel, req.Model, baseModel)
+		translated = applyQwenPromptCachingCompatibility(translated, requestedModel, req.Model, baseModel, gjson.GetBytes(originalPayload, "model").String())
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -328,6 +329,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = e.applyDeepSeekThinkingCompatibility(auth, translated, originalPayload, from.String(), requestedModel, req.Model, baseModel)
+	translated = applyQwenPromptCachingCompatibility(translated, requestedModel, req.Model, baseModel, gjson.GetBytes(originalPayload, "model").String())
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
@@ -949,6 +951,119 @@ func applyDeepSeekResponsesChatCompatibility(translated, original []byte) []byte
 	}
 
 	return out
+}
+
+func applyQwenPromptCachingCompatibility(translated []byte, models ...string) []byte {
+	if !qwenPromptCachingCompatibilityEnabledForModels(models...) {
+		return translated
+	}
+	return injectOpenAIChatMessagesCacheControl(translated)
+}
+
+func qwenPromptCachingCompatibilityEnabledForModels(models ...string) bool {
+	for _, model := range models {
+		if isQwenPromptCachingModel(model) {
+			return true
+		}
+	}
+	return false
+}
+
+func isQwenPromptCachingModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	model = thinking.ParseSuffix(model).ModelName
+	model = strings.ToLower(strings.TrimSpace(model))
+	switch model {
+	case "qwen3.6-plus", "qwen3.5-plus":
+		return true
+	default:
+		return false
+	}
+}
+
+func injectOpenAIChatMessagesCacheControl(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	hasMessageCacheControl := false
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if content.IsArray() {
+			content.ForEach(func(_, item gjson.Result) bool {
+				if item.Get("cache_control").Exists() {
+					hasMessageCacheControl = true
+					return false
+				}
+				return true
+			})
+		}
+		return !hasMessageCacheControl
+	})
+	if hasMessageCacheControl {
+		return payload
+	}
+
+	var userMsgIndices []int
+	messages.ForEach(func(index gjson.Result, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			userMsgIndices = append(userMsgIndices, int(index.Int()))
+		}
+		return true
+	})
+	if len(userMsgIndices) == 0 {
+		return payload
+	}
+
+	targetIdx := userMsgIndices[len(userMsgIndices)-1]
+	if len(userMsgIndices) >= 2 {
+		targetIdx = userMsgIndices[len(userMsgIndices)-2]
+	}
+	return injectOpenAIChatMessageCacheControlAt(payload, targetIdx)
+}
+
+func injectOpenAIChatMessageCacheControlAt(payload []byte, messageIdx int) []byte {
+	contentPath := fmt.Sprintf("messages.%d.content", messageIdx)
+	content := gjson.GetBytes(payload, contentPath)
+	if !content.Exists() {
+		return payload
+	}
+
+	if content.IsArray() {
+		contentCount := int(content.Get("#").Int())
+		if contentCount == 0 {
+			return payload
+		}
+		cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", messageIdx, contentCount-1)
+		result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
+		if err != nil {
+			log.Warnf("failed to inject qwen cache_control into messages: %v", err)
+			return payload
+		}
+		return result
+	}
+
+	if content.Type == gjson.String {
+		newContent := []map[string]any{{
+			"type": "text",
+			"text": content.String(),
+			"cache_control": map[string]string{
+				"type": "ephemeral",
+			},
+		}}
+		result, err := sjson.SetBytes(payload, contentPath, newContent)
+		if err != nil {
+			log.Warnf("failed to inject qwen cache_control into message string content: %v", err)
+			return payload
+		}
+		return result
+	}
+
+	return payload
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {
