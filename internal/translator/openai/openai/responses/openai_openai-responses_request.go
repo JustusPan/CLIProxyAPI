@@ -44,6 +44,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
+	// Preserve prompt_cache_key when a Responses request is downgraded to
+	// chat/completions. Some OpenAI-compatible upstreams use this field as the
+	// cache/session anchor; dropping it here breaks multi-turn prompt caching.
+	if promptCacheKey := strings.TrimSpace(root.Get("prompt_cache_key").String()); promptCacheKey != "" {
+		out, _ = sjson.SetBytes(out, "prompt_cache_key", promptCacheKey)
+	}
+
 	if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Exists() {
 		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())
 	}
