@@ -127,16 +127,21 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	// Stream
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// instructions -> as a leading message (use role user for Claude API compatibility)
+	// instructions -> Claude top-level system blocks
 	instructionsText := ""
 	extractedFromSystem := false
+	appendSystemText := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		sysPart := []byte(`{"type":"text","text":""}`)
+		sysPart, _ = sjson.SetBytes(sysPart, "text", text)
+		out, _ = sjson.SetRawBytes(out, "system.-1", sysPart)
+	}
 	if instr := root.Get("instructions"); instr.Exists() && instr.Type == gjson.String {
 		instructionsText = instr.String()
-		if instructionsText != "" {
-			sysMsg := []byte(`{"role":"user","content":""}`)
-			sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-			out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
-		}
+		appendSystemText(instructionsText)
 	}
 
 	if instructionsText == "" {
@@ -159,9 +164,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					}
 					instructionsText = builder.String()
 					if instructionsText != "" {
-						sysMsg := []byte(`{"role":"user","content":""}`)
-						sysMsg, _ = sjson.SetBytes(sysMsg, "content", instructionsText)
-						out, _ = sjson.SetRawBytes(out, "messages.-1", sysMsg)
+						appendSystemText(instructionsText)
 						extractedFromSystem = true
 					}
 				}

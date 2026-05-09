@@ -568,3 +568,62 @@ func TestConvertOpenAIResponsesRequestToClaude_GroupsConsecutiveToolResultsIntoS
 		t.Fatalf("second content[1].tool_use_id = %q, want call_b", got)
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToClaude_PlacesInstructionsIntoSystem(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-opus-4-7-xhigh-thinking",
+		"instructions":"Always answer briefly.",
+		"input":[
+			{
+				"role":"user",
+				"content":[{"type":"input_text","text":"hello"}]
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("claude-opus-4-7-xhigh-thinking", inputJSON, false)
+
+	if got := gjson.GetBytes(result, "system.0.type").String(); got != "text" {
+		t.Fatalf("system[0].type = %q, want text: %s", got, string(result))
+	}
+	if got := gjson.GetBytes(result, "system.0.text").String(); got != "Always answer briefly." {
+		t.Fatalf("system[0].text = %q, want instructions text", got)
+	}
+	if got := len(gjson.GetBytes(result, "messages").Array()); got != 1 {
+		t.Fatalf("messages len = %d, want 1: %s", got, string(result))
+	}
+	if got := gjson.GetBytes(result, "messages.0.role").String(); got != "user" {
+		t.Fatalf("messages[0].role = %q, want user", got)
+	}
+	if got := gjson.GetBytes(result, "messages.0.content").String(); got != "hello" {
+		t.Fatalf("messages[0].content = %q, want hello", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_PlacesSystemInputIntoSystem(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-opus-4-7-xhigh-thinking",
+		"input":[
+			{
+				"role":"system",
+				"content":[{"type":"input_text","text":"Use Chinese."}]
+			},
+			{
+				"role":"user",
+				"content":[{"type":"input_text","text":"hello"}]
+			}
+		]
+	}`)
+
+	result := ConvertOpenAIResponsesRequestToClaude("claude-opus-4-7-xhigh-thinking", inputJSON, false)
+
+	if got := gjson.GetBytes(result, "system.0.text").String(); got != "Use Chinese." {
+		t.Fatalf("system[0].text = %q, want system input text: %s", got, string(result))
+	}
+	if got := len(gjson.GetBytes(result, "messages").Array()); got != 1 {
+		t.Fatalf("messages len = %d, want 1: %s", got, string(result))
+	}
+	if got := gjson.GetBytes(result, "messages.0.content").String(); got != "hello" {
+		t.Fatalf("messages[0].content = %q, want hello", got)
+	}
+}
