@@ -136,9 +136,9 @@ transient-error-cooldown-seconds: 0
 
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and
 # system prompt replacement), so the original system prompt is passed through to Claude as-is.
-# Individual credentials can still override this: a claude-api-key entry via its "cloak.mode",
-# or a Claude OAuth/token file via a "cloak_mode" value. Default false keeps the per-client
-# "auto" behavior (cloak only non-Claude-Code clients).
+# Individual credentials can still override this with an explicit mode. By default, cloaking is
+# inactive unless a claude-api-key has a "cloak" block or an OAuth/token file defines cloak settings;
+# an empty "cloak: {}" block enables per-client "auto" behavior.
 disable-claude-cloak-mode: false
 
 # disable-image-generation supports: false (default), true, "chat", or "passthrough".

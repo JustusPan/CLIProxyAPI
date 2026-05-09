@@ -1761,11 +1761,10 @@ func getWorkloadFromContext(ctx context.Context) string {
 
 // getCloakConfigFromAuth extracts cloak configuration from the auth's attributes,
 // falling back to its stored metadata (the raw OAuth/token JSON). Returns
-// (cloakMode, strictMode, sensitiveWords, cacheUserID); an empty cloakMode means
-// the credential did not explicitly configure a mode.
-func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID bool) {
+// (cloakMode, strictMode, sensitiveWords, cacheUserID, hasExplicitCloakConfig).
+func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID bool, hasExplicitCloakConfig bool) {
 	if auth == nil {
-		return "", false, nil, false
+		return "", false, nil, false, false
 	}
 
 	// lookupCloakAttr prefers the executor-facing Attributes, then falls back to the
@@ -1799,8 +1798,9 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMo
 	}
 
 	cacheUserID = strings.EqualFold(lookupCloakAttr("cloak_cache_user_id"), "true")
+	hasExplicitCloakConfig = strings.TrimSpace(cloakMode) != "" || strictMode || len(sensitiveWords) > 0 || cacheUserID
 
-	return cloakMode, strictMode, sensitiveWords, cacheUserID
+	return cloakMode, strictMode, sensitiveWords, cacheUserID, hasExplicitCloakConfig
 }
 
 // injectFakeUserID generates and injects a fake user ID into the request metadata.
@@ -2058,16 +2058,18 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 
 	// Get cloak config from ClaudeKey configuration
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
-	attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
+	attrMode, attrStrict, attrWords, attrCache, attrHasExplicit := getCloakConfigFromAuth(auth)
 
 	// Determine cloak settings. Precedence (low -> high):
-	//   built-in "auto" default
+	//   no cloaking unless explicitly configured
 	//   -> global disable-claude-cloak-mode switch (forces "never")
 	//   -> per-credential settings from auth attributes/metadata
 	//   -> per claude-api-key cloak config
-	cloakMode := "auto"
+	cloakMode := ""
+	hasExplicitCloakConfig := attrHasExplicit
 	if cfg != nil && cfg.DisableClaudeCloakMode {
 		cloakMode = "never"
+		hasExplicitCloakConfig = true
 	}
 	strictMode := attrStrict
 	sensitiveWords := attrWords
@@ -2078,6 +2080,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	}
 
 	if cloakCfg != nil {
+		hasExplicitCloakConfig = true
 		if mode := strings.TrimSpace(cloakCfg.Mode); mode != "" {
 			cloakMode = mode
 		}
@@ -2090,6 +2093,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		if cloakCfg.CacheUserID != nil {
 			cacheUserID = *cloakCfg.CacheUserID
 		}
+	}
+	if !hasExplicitCloakConfig {
+		return payload, nil
+	}
+	if strings.TrimSpace(cloakMode) == "" {
+		cloakMode = "auto"
 	}
 
 	// Determine if cloaking should be applied

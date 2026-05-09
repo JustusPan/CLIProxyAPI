@@ -1395,7 +1395,7 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
 }
 
-func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
+func TestClaudeExecutor_GeneratesNewUserIDWhenCloakingExplicitlyEnabled(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1405,7 +1405,13 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey:  "key-123",
+			BaseURL: server.URL,
+			Cloak:   &config.CloakConfig{},
+		}},
+	})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
@@ -2548,7 +2554,13 @@ func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader
 	}))
 	defer server.Close()
 
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(&config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey:  "key-123",
+			BaseURL: server.URL,
+			Cloak:   &config.CloakConfig{},
+		}},
+	})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":  "key-123",
 		"base_url": server.URL,
@@ -2590,6 +2602,7 @@ func TestClaudeExecutor_ExperimentalCCHSigningOptInSignsFinalBody(t *testing.T) 
 			APIKey:                 "key-123",
 			BaseURL:                server.URL,
 			ExperimentalCCHSigning: true,
+			Cloak:                  &config.CloakConfig{},
 		}},
 	})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
@@ -2750,6 +2763,57 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(got, "\u200B") {
 		t.Fatalf("expected configured sensitive word obfuscation to apply, got %q", got)
+	}
+}
+
+func TestApplyCloaking_DoesNotCloakWithoutExplicitConfig(t *testing.T) {
+	cfg := &config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "key-123",
+		}},
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
+	payload := []byte(`{"system":"custom system","messages":[{"role":"user","content":"hello"}]}`)
+
+	out, errCloaking := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+
+	if got := gjson.GetBytes(out, "system").String(); got != "custom system" {
+		t.Fatalf("system = %q, want original system prompt", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hello" {
+		t.Fatalf("message content = %q, want original content", got)
+	}
+	if gjson.GetBytes(out, "metadata.user_id").Exists() {
+		t.Fatalf("expected no cloaked metadata.user_id injection, got %s", string(out))
+	}
+}
+
+func TestApplyCloaking_EmptyCloakConfigDefaultsToAuto(t *testing.T) {
+	cfg := &config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "key-123",
+			Cloak:  &config.CloakConfig{},
+		}},
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
+	payload := []byte(`{"system":"custom system","messages":[{"role":"user","content":"hello"}]}`)
+
+	out, errCloaking := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+
+	if got := gjson.GetBytes(out, "system.#").Int(); got != 3 {
+		t.Fatalf("expected default auto cloak to inject 3 Claude Code system blocks, got %d", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content").String(); !strings.Contains(got, "<system-reminder>") {
+		t.Fatalf("expected forwarded system reminder in first user message, got %q", got)
+	}
+	if !gjson.GetBytes(out, "metadata.user_id").Exists() {
+		t.Fatalf("expected cloaking to inject metadata.user_id, got %s", string(out))
 	}
 }
 
